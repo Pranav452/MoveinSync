@@ -17,6 +17,7 @@ import { LiveKitRoom, useVoiceAssistant, RoomAudioRenderer, useDataChannel, useR
 import '@livekit/components-styles';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
+import ReactMarkdown from 'react-markdown';
 
 const ROOM_NAME = 'movi-voice-room';
 
@@ -266,33 +267,29 @@ function ChatInterface({ onEnd }: { onEnd: () => void }) {
   }, [state, startBrowserSTT, stopBrowserSTT, liveUserText]);
 
   // --- LiveKit Data Channels ---
-  useDataChannel('lk.transcription', (msg) => {
-    try {
-      const data = JSON.parse(new TextDecoder().decode(msg.payload));
-      if (data.text && data.participant?.identity?.includes('agent')) {
-         // Agent streaming response
-         setMessages(prev => {
-            const last = prev[prev.length - 1];
-            if (last && last.role === 'assistant' && last.isStreaming) {
-              return [...prev.slice(0, -1), { ...last, content: last.content + data.text }];
-            }
-            return [...prev, {
-              id: Date.now().toString(),
-              role: 'assistant',
-              content: data.text,
-              timestamp: new Date(),
-              isStreaming: true
-            }];
-         });
-      }
-    } catch(e) { console.error(e); }
-  });
-
   useDataChannel('agent.thoughts', (msg) => {
     try {
       const data = JSON.parse(new TextDecoder().decode(msg.payload));
-      // Handle tool calls visualization
-      if (data.type === 'tool_call') {
+      
+      // --- Handle Transcription (Agent/User) ---
+      if (data.type === 'transcription') {
+        const role = data.toolName === 'agent' ? 'assistant' : 'user';
+        setMessages(prev => {
+           // If user just spoke, replace the "liveUserText" or avoid dupes
+           if (role === 'user') {
+             setLiveUserText(''); // Clear live text
+           }
+           return [...prev, {
+             id: Date.now().toString(),
+             role: role,
+             content: data.content,
+             timestamp: new Date(),
+             isStreaming: false // Completed text
+           }];
+        });
+      }
+      // --- Handle Tool Calls ---
+      else if (data.type === 'tool_call') {
         const newTool: ToolStatus = {
           id: Date.now().toString(),
           name: data.toolName || 'Unknown Tool',
@@ -427,12 +424,26 @@ function ChatInterface({ onEnd }: { onEnd: () => void }) {
              ) : (
                /* Chat Message */
                <div className={cn(
-                 "max-w-[80%] rounded-2xl p-5 shadow-sm",
+                 "max-w-[80%] rounded-2xl p-5 shadow-sm prose prose-sm",
                  msg.role === 'user' 
-                   ? "bg-green-600 text-white rounded-br-none shadow-green-100" 
+                   ? "bg-green-600 text-white rounded-br-none shadow-green-100 prose-invert" 
                    : "bg-white border border-gray-100 text-gray-800 rounded-bl-none shadow-sm"
                )}>
-                 <p className="text-sm leading-relaxed">{msg.content}</p>
+                  <ReactMarkdown 
+                    components={{
+                      p: ({children}) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+                      ul: ({children}) => <ul className="list-disc list-inside mb-2 space-y-1">{children}</ul>,
+                      ol: ({children}) => <ol className="list-decimal list-inside mb-2 space-y-1">{children}</ol>,
+                      li: ({children}) => <li className="ml-2">{children}</li>,
+                      table: ({children}) => <div className="overflow-x-auto my-2"><table className="min-w-full divide-y divide-gray-200 text-xs">{children}</table></div>,
+                      thead: ({children}) => <thead className="bg-gray-50">{children}</thead>,
+                      th: ({children}) => <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">{children}</th>,
+                      td: ({children}) => <td className="px-3 py-2 whitespace-nowrap text-gray-500">{children}</td>,
+                      strong: ({children}) => <span className="font-bold">{children}</span>,
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
                  {msg.role === 'assistant' && msg.isStreaming && (
                    <span className="inline-block w-1.5 h-4 bg-green-400 ml-1 animate-pulse align-middle" />
                  )}
