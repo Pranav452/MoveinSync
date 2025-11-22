@@ -157,7 +157,169 @@ npm run dev
 
 ---
 
-## 6. Future Roadmap
+## 6. Testing & User Interaction Guide
+
+### 6.1 Text Chat Interface (Movi Widget)
+
+The Movi Chat Widget is available on both the `busDashboard` and `manageRoute` pages. Click the "Ask Movi" floating action button in the bottom-right corner to open the chat interface.
+
+#### Test Prompts for Dashboard Operations
+
+**Query Operations (Read-Only):**
+```
+"List all trips scheduled for today"
+"How many vehicles are currently unassigned?"
+"What is the status of the trip 'Bulk - 00:01'?"
+"Show me all routes that use Path-1"
+"Which trips have bookings above 50%?"
+"List all stops for Path-2"
+```
+
+**Create Operations:**
+```
+"Create a new stop called 'Odeon Circle' at latitude 12.9716 and longitude 77.5946"
+"Create a path called 'Tech-Loop' using stops [Gavipuram, Temple, Peenya]"
+"Create a new route for Path-2 at 19:45 in the Outbound direction"
+"Add a new driver named 'Rajesh Kumar' with phone number '+91-9876543210'"
+```
+
+**Assignment Operations:**
+```
+"Assign vehicle 'MH-12-3456' and driver 'Amit' to the trip 'Bulk - 00:01'"
+"Show me all available buses that can be assigned"
+```
+
+**Dangerous Operations (Will Trigger Consequence Check):**
+```
+"Remove the vehicle from 'Bulk - 00:01'"
+"Delete the trip 'Morning Express'"
+```
+
+*Note: If the trip has bookings, Movi will intercept and ask for explicit confirmation before proceeding.*
+
+#### Test Prompts for Route Management
+
+**Static Asset Queries:**
+```
+"List all active routes"
+"Show me all paths in the system"
+"What stops are included in Path-1?"
+"Which routes are scheduled for the morning shift?"
+```
+
+**Route Creation Workflow:**
+```
+"Create a new stop called 'Silk Board Junction'"
+"Create a path 'North-Link' with stops [Stop-A, Stop-B, Stop-C]"
+"Create a route for 'North-Link' at 08:00 AM in the Inbound direction"
+```
+
+### 6.2 Voice Chat Interface
+
+Navigate to the "Voice Chat" page from the sidebar to access the real-time voice interface powered by LiveKit, Deepgram, and ElevenLabs.
+
+#### Voice Test Scenarios
+
+**Natural Language Queries:**
+```
+"Hey Movi, can you tell me how many trips we have scheduled for today?"
+"What's the status of all our active vehicles?"
+"Do we have any buses available right now?"
+"Show me the schedule for the morning routes"
+```
+
+**Voice Commands:**
+```
+"Assign a bus to the 8 AM Tech Park route"
+"List all stops for the North-Link path"
+"Create a new stop called Central Station"
+"What trips are currently in transit?"
+```
+
+**Interactive Conversations:**
+```
+User: "How many vehicles are free?"
+Movi: "I found 3 unassigned vehicles. Would you like me to list them?"
+
+User: "Yes, show me the details"
+Movi: "Here are the available vehicles: [Lists vehicles with license plates and capacity]"
+```
+
+### 6.3 Image Analysis (Multimodal Input)
+
+The chat widget supports image uploads for visual troubleshooting and rapid issue identification.
+
+#### Image Test Scenarios
+
+**Screenshot Analysis:**
+1. Take a screenshot of the busDashboard showing a trip with a red alert indicator.
+2. Click the image icon in the chat widget.
+3. Upload the screenshot.
+4. Type: "What's wrong with this trip?"
+5. Movi will use GPT-4o Vision to analyze the image and identify the issue.
+
+**Visual Command Execution:**
+1. Upload a screenshot of a specific trip row.
+2. Type: "Remove the vehicle from this trip"
+3. Movi will extract the trip identifier from the image and execute the command (with consequence checks if applicable).
+
+**Dashboard Context Understanding:**
+1. Upload a screenshot of the manageRoute page.
+2. Ask: "Help me create a new route based on what you see here"
+3. Movi will analyze the existing route structure and guide you through creation.
+
+### 6.4 Testing the "Tribal Knowledge" Flow
+
+This is the critical safety feature that prevents operational errors.
+
+**Test Scenario 1: Safe Removal**
+1. Find a trip with 0% bookings (or create one via the UI).
+2. In chat, type: "Remove the vehicle from [Trip Name]"
+3. Expected: Movi executes immediately without warnings.
+
+**Test Scenario 2: High-Risk Removal**
+1. Find a trip with bookings > 0% (e.g., 25% booked).
+2. In chat, type: "Remove the vehicle from [Trip Name]"
+3. Expected: Movi intercepts and responds:
+   ```
+   "⚠️ WAIT! This trip is 25% booked. Removing the vehicle will cancel these bookings and a trip-sheet will fail to generate. Do you want to proceed?"
+   ```
+4. Type "Yes" to confirm or "No" to cancel.
+5. If confirmed, Movi executes the removal.
+
+**Test Scenario 3: Context-Aware Help**
+1. Navigate to the `manageRoute` page.
+2. Open Movi chat widget.
+3. Type: "Help me create a new route"
+4. Expected: Movi provides guidance specific to route management, understanding you're on the route management page.
+
+### 6.5 Advanced Testing Scenarios
+
+**Multi-Step Workflow:**
+```
+User: "I need to set up a new morning route"
+Movi: "I can help with that. First, let's create the stops. What's the first stop name?"
+User: "Tech Park Entrance"
+Movi: "Created stop 'Tech Park Entrance'. What's the next stop?"
+[... continues through path creation, route creation, and trip assignment]
+```
+
+**Error Handling:**
+```
+User: "Remove vehicle from trip that doesn't exist"
+Movi: "I couldn't find a trip with that name. Let me list today's trips for you..."
+```
+
+**Knowledge Base Queries:**
+```
+"How do I deactivate a route?"
+"What happens when I remove a vehicle from a trip?"
+"Explain the difference between a path and a route"
+```
+
+---
+
+## 7. Future Roadmap
 
 1.  **Predictive Fleet Sizing**: Integrating Prophet models to forecast demand based on historical `daily_trips` data.
 2.  **Driver Voice Assistant**: Extending the LiveKit worker to a mobile app for drivers to report breakdowns via voice.
