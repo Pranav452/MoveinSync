@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-dotenv
+supabase
+langchain
+langchain-openai
+langchain-community
+langgraph
+langgraph-checkpoint-postgres
+psycopg-binary
+psycopg-pool
+openai
+pyjwt
+python-multipart
+livekit-api==0.8.2
