@@ -89,46 +89,70 @@ async def get_stops():
 
 @app.post("/api/chat")
 async def chat_endpoint(request: Request, chat_req: ChatRequest):
-    # Check if this is from voice chat - use simple OpenAI chat
-    if chat_req.current_page == "voiceChat":
-        try:
-            logger.info(f"💬 Voice chat message: {chat_req.message[:50]}...")
-            
-            # Simple OpenAI chat for voice - no agent/database needed
-            response = await openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are Movi, a helpful AI assistant for MoveInSync transport management. Be concise and natural in your responses. Help with questions about buses, routes, vehicles, and transport logistics."},
-                    {"role": "user", "content": chat_req.message}
-                ],
-                max_tokens=150,
-                temperature=0.7
-            )
-            
-            return {
-                "response": response.choices[0].message.content,
-                "awaiting_confirmation": False
-            }
-        except Exception as e:
-            logger.error(f"Voice Chat Error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    # For text chat, use the agent (with database)
+    """
+    Main Movi chat endpoint.
+
+    Always tries to use the LangGraph agent (with DB + tools) first so that:
+    - Tribal knowledge / consequence checks run
+    - Supabase-backed tools are available
+    - Same behavior for text and voice callers
+
+    If the agent / DB path fails (e.g. Postgres checkpoint issues), we fall back
+    to a simple OpenAI chat response so the UI does not break completely.
+    """
     agent = request.app.state.agent
+
+    # First, try full agent + DB path
     try:
+        logger.info(f"💬 Movi chat request (page={chat_req.current_page}, thread={chat_req.thread_id}): {chat_req.message[:80]}...")
+
         config = {"configurable": {"thread_id": chat_req.thread_id}}
         inputs = {
             "messages": [HumanMessage(content=chat_req.message)],
-            "current_page": chat_req.current_page
+            "current_page": chat_req.current_page,
         }
+
         final_state = await agent.ainvoke(inputs, config=config)
         return {
             "response": final_state["messages"][-1].content,
-            "awaiting_confirmation": final_state.get("awaiting_confirmation", False)
+            "awaiting_confirmation": final_state.get("awaiting_confirmation", False),
         }
-    except Exception as e:
-        logger.error(f"Chat Error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+
+    except Exception as agent_err:
+        # Log and fall back to stateless OpenAI chat so UX keeps working
+        logger.error(f"Chat Error via LangGraph agent (falling back to direct LLM): {agent_err}", exc_info=True)
+
+        try:
+            system_prompt = (
+                "You are Movi, a helpful AI assistant for MoveInSync transport management. "
+                "When the database/tools are unavailable, you should still answer generally "
+                "about buses, routes, vehicles, trips and transport logistics, but you CANNOT "
+                "see or change real data. Make this limitation clear when relevant."
+            )
+
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": f"[current_page={chat_req.current_page}] {chat_req.message}",
+                    },
+                ],
+                max_tokens=300,
+                temperature=0.7,
+            )
+
+            return {
+                "response": response.choices[0].message.content,
+                "awaiting_confirmation": False,
+            }
+        except Exception as fallback_err:
+            logger.error(f"Chat fallback Error (direct LLM also failed): {fallback_err}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chat failed (agent + fallback): {str(fallback_err)}",
+            )
 
 @app.post("/api/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):

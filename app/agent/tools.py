@@ -40,8 +40,17 @@ def list_todays_trips():
 
 @tool
 def list_unassigned_vehicles():
-    """List vehicles that are currently NOT deployed on any active trip."""
-    # In a real app, we'd do a join/exclusion. For prototype, we just list all.
+    """
+    List all vehicles (buses/cabs) with their details.
+    
+    Use this when the user asks for:
+    - "List all available buses"
+    - "Show me all vehicles"
+    - "How many vehicles are not assigned?"
+
+    NOTE: For this prototype we simply return all rows from the `vehicles` table.
+    The agent is responsible for explaining any limitations in the answer.
+    """
     response = supabase.table("vehicles").select("*").execute()
     return json.dumps(response.data)
 

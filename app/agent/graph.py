@@ -8,9 +8,15 @@ import os
 
 # FIX: Import the new tool
 from app.agent.tools import (
-    list_all_routes, list_stops_for_path, get_trip_details, 
-    create_new_stop, assign_vehicle_to_trip, remove_vehicle_from_trip_action,
-    search_knowledge_base, list_todays_trips
+    list_all_routes,
+    list_stops_for_path,
+    get_trip_details,
+    create_new_stop,
+    assign_vehicle_to_trip,
+    remove_vehicle_from_trip_action,
+    search_knowledge_base,
+    list_todays_trips,
+    list_unassigned_vehicles,
 )
 
 from app.agent.state import AgentState
@@ -26,15 +32,24 @@ CRITICAL RULES:
 2. **SAFETY CHECK:** 
    - Once you have the `trip_id`, call `remove_vehicle_from_trip_action`.
    - Do NOT check bookings yourself. The system will intercept and check safety.
+
+3. **VEHICLE LISTING:**
+   - When the user asks for "all available buses", "all vehicles", or similar, you MUST call `list_unassigned_vehicles`.
+   - Then, summarise the vehicles clearly: ID, license plate, type, capacity.
 """
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-# FIX: Add list_todays_trips to the list
 tools = [
-    list_all_routes, list_stops_for_path, get_trip_details, 
-    create_new_stop, assign_vehicle_to_trip, remove_vehicle_from_trip_action, 
-    search_knowledge_base, list_todays_trips
+    list_all_routes,
+    list_stops_for_path,
+    get_trip_details,
+    create_new_stop,
+    assign_vehicle_to_trip,
+    remove_vehicle_from_trip_action,
+    search_knowledge_base,
+    list_todays_trips,
+    list_unassigned_vehicles,
 ]
 
 llm_with_tools = llm.bind_tools(tools)
