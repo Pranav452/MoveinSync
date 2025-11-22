@@ -1,485 +1,503 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
-import { Mic, MicOff, Volume2, Loader2, Send, RotateCcw } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  Mic, 
+  StopCircle, 
+  Bot, 
+  User, 
+  Sparkles, 
+  ArrowRight, 
+  Activity, 
+  Cpu,
+  CheckCircle2,
+  Clock
+} from 'lucide-react';
+import { LiveKitRoom, useVoiceAssistant, RoomAudioRenderer, useDataChannel, useRoomContext } from '@livekit/components-react';
+import '@livekit/components-styles';
+import { motion, AnimatePresence } from 'framer-motion';
+import { cn } from '@/lib/utils';
 
+const ROOM_NAME = 'movi-voice-room';
+
+// --- Types ---
 interface Message {
   id: string;
-  type: 'user' | 'assistant';
-  text: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
   timestamp: Date;
-  audioUrl?: string;
+  isStreaming?: boolean;
+  metadata?: {
+    toolName?: string;
+    status?: 'pending' | 'success' | 'error';
+  };
 }
 
-const VOICE_PERSONAS = [
-  { id: 'alloy', name: 'Alloy', color: '#3b82f6', description: 'Neutral and balanced' },
-  { id: 'echo', name: 'Echo', color: '#8b5cf6', description: 'Warm and conversational' },
-  { id: 'fable', name: 'Fable', color: '#ec4899', description: 'Expressive and dynamic' },
-  { id: 'onyx', name: 'Onyx', color: '#64748b', description: 'Deep and authoritative' },
-  { id: 'nova', name: 'Nova', color: '#06b6d4', description: 'Bright and energetic' },
-  { id: 'shimmer', name: 'Shimmer', color: '#f59e0b', description: 'Gentle and soothing' },
-];
+interface ToolStatus {
+  id: string;
+  name: string;
+  status: 'running' | 'completed' | 'failed';
+  message: string;
+}
 
-export default function VoiceChatPage() {
-  // Generate a NEW session ID on every page load/refresh
-  const [threadId] = useState(() => `voice_${Date.now()}_${Math.random().toString(36).substring(7)}`);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [isRecording, setIsRecording] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [selectedVoice, setSelectedVoice] = useState('nova');
-  const [showVoiceSelector, setShowVoiceSelector] = useState(false);
-  const [audioPlaying, setAudioPlaying] = useState<string | null>(null);
-  const [recordingDuration, setRecordingDuration] = useState(0);
-  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('default');
-  
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const recordingStartTimeRef = useRef<number>(0);
-  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+// --- Browser Speech Recognition Polyfill ---
+const useBrowserSpeech = (onTranscript: (text: string, isFinal: boolean) => void) => {
+  const recognitionRef = useRef<any>(null);
+  const [isListening, setIsListening] = useState(false);
 
-  // Log session info
   useEffect(() => {
-    console.log('🆕 New voice chat session started:', threadId);
-  }, [threadId]);
+    if (typeof window !== 'undefined') {
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
 
-  // Load available microphone devices
-  useEffect(() => {
-    const loadDevices = async () => {
-      try {
-        if (!navigator.mediaDevices?.enumerateDevices) {
-          console.warn('enumerateDevices not supported in this browser');
-          return;
-        }
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const audioInputs = devices.filter((d) => d.kind === 'audioinput');
-        setAudioDevices(audioInputs);
-      } catch (err) {
-        console.error('Error listing audio devices:', err);
+        recognition.onresult = (event: any) => {
+          let interimTranscript = '';
+          let finalTranscript = '';
+
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+              finalTranscript += event.results[i][0].transcript;
+            } else {
+              interimTranscript += event.results[i][0].transcript;
+            }
+          }
+          
+          const text = finalTranscript || interimTranscript;
+          if (text) {
+             onTranscript(text, !!finalTranscript);
+          }
+        };
+
+        recognition.onerror = (event: any) => {
+          console.warn('Speech recognition error', event.error);
+        };
+        
+        recognitionRef.current = recognition;
       }
-    };
+    }
+  }, [onTranscript]);
 
-    loadDevices();
+  const start = useCallback(() => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (e) {
+        // Often throws if already started
+      }
+    }
   }, []);
 
-  const startNewChat = () => {
-    if (confirm('Start a new conversation? This will clear your current chat.')) {
-      window.location.reload();
+  const stop = useCallback(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
     }
-  };
+  }, []);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  return { isListening, start, stop };
+};
 
-  const startRecording = async () => {
+export default function VoiceChatPage() {
+  const [isStarted, setIsStarted] = useState(false);
+  const [token, setToken] = useState<string>('');
+
+  const connect = async () => {
     try {
-      const audioConstraints: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: false,
-        autoGainControl: true,
-        sampleRate: 48000,
-        channelCount: 1,
-      };
-
-      if (selectedDeviceId !== 'default') {
-        audioConstraints.deviceId = { exact: selectedDeviceId };
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: audioConstraints,
-      });
-      
-      let options = { mimeType: 'audio/webm' };
-      if (!MediaRecorder.isTypeSupported('audio/webm')) {
-        options = { mimeType: 'audio/mp4' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = {};
-      }
-      
-      const mediaRecorder = new MediaRecorder(stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        if (recordingTimerRef.current) {
-          clearInterval(recordingTimerRef.current);
-          recordingTimerRef.current = null;
-        }
-        
-        const recordingDuration = (Date.now() - recordingStartTimeRef.current) / 1000;
-        const totalSize = audioChunksRef.current.reduce((sum, chunk) => sum + chunk.size, 0);
-        
-        if (recordingDuration < 0.5) {
-          alert('Recording too short! Please hold the button longer and speak your full message.');
-          stream.getTracks().forEach(track => track.stop());
-          setRecordingDuration(0);
-          return;
-        }
-        
-        if (totalSize === 0) {
-          alert('No audio was recorded. Please check your microphone and try again.');
-          stream.getTracks().forEach(track => track.stop());
-          setRecordingDuration(0);
-          return;
-        }
-        
-        const audioBlob = new Blob(audioChunksRef.current, { type: options.mimeType || 'audio/webm' });
-        setRecordingDuration(0);
-        await processAudio(audioBlob);
-        stream.getTracks().forEach(track => track.stop());
-      };
-
-      mediaRecorder.start(100);
-      setIsRecording(true);
-      recordingStartTimeRef.current = Date.now();
-      setRecordingDuration(0);
-      
-      recordingTimerRef.current = setInterval(() => {
-        const duration = (Date.now() - recordingStartTimeRef.current) / 1000;
-        setRecordingDuration(duration);
-      }, 100);
-      
-    } catch (error) {
-      console.error('❌ Error accessing microphone:', error);
-      alert('Could not access microphone. Please check permissions.');
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      if (mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
-      }
-      setIsRecording(false);
-    }
-  };
-
-  const processAudio = async (blob: Blob) => {
-    setIsProcessing(true);
-
-    try {
-      const formData = new FormData();
-      const filename = blob.type.includes('mp4') ? 'recording.mp4' : 'recording.webm';
-      formData.append('audio', blob, filename);
-      
-      const transcriptResponse = await fetch('http://localhost:8000/api/transcribe', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!transcriptResponse.ok) throw new Error('Transcription failed');
-
-      const transcriptData = await transcriptResponse.json();
-      const userText = transcriptData.text || "I couldn't hear you clearly.";
-
-      const userMessage: Message = {
-        id: Date.now().toString(),
-        type: 'user',
-        text: userText,
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, userMessage]);
-
-      const chatResponse = await fetch('http://localhost:8000/api/chat', {
+      const participantName = `user_${Math.random().toString(36).substring(7)}`;
+      const response = await fetch('http://localhost:8000/api/livekit-token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: userText,
-          thread_id: threadId,
-          current_page: 'voiceChat',
+          room_name: ROOM_NAME,
+          participant_name: participantName,
         }),
       });
-
-      if (!chatResponse.ok) throw new Error('Chat failed');
-
-      const chatData = await chatResponse.json();
-      const aiText = chatData.response || chatData.text || "I couldn't process that request.";
-
-      const ttsResponse = await fetch('http://localhost:8000/api/text-to-speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: aiText,
-          voice: selectedVoice,
-        }),
-      });
-
-      if (!ttsResponse.ok) throw new Error('TTS failed');
-
-      const responseAudioBlob = await ttsResponse.blob();
-      const audioUrl = URL.createObjectURL(responseAudioBlob);
-
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        type: 'assistant',
-        text: aiText,
-        timestamp: new Date(),
-        audioUrl,
-      };
-      setMessages(prev => [...prev, assistantMessage]);
-      playAudio(audioUrl, assistantMessage.id);
+      const data = await response.json();
+      setToken(data.token);
+      setIsStarted(true);
     } catch (error) {
-      console.error('Error processing audio:', error);
-      const errorMessage: Message = {
-        id: (Date.now() + 2).toString(),
-        type: 'assistant',
-        text: `Sorry, I encountered an error. Please try again.`,
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setIsProcessing(false);
+      console.error('Failed to connect:', error);
+      alert('Failed to connect to voice server.');
     }
   };
 
-  const playAudio = (audioUrl: string, messageId: string) => {
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-    }
-
-    const audio = new Audio(audioUrl);
-    currentAudioRef.current = audio;
-    setAudioPlaying(messageId);
-
-    audio.onended = () => {
-      setAudioPlaying(null);
-      currentAudioRef.current = null;
-    };
-
-    audio.play();
+  const handleEnd = () => {
+    setIsStarted(false);
+    setToken('');
   };
-
-  const selectedVoiceData = VOICE_PERSONAS.find(v => v.id === selectedVoice) || VOICE_PERSONAS[4];
 
   return (
-    <div className="h-full flex flex-col bg-gray-50">
-      {/* Header */}
-      <div className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm">
-        <div className="max-w-4xl mx-auto flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">Movi Voice Chat</h1>
-            <p className="text-sm text-gray-500 mt-1">Speak naturally with your AI assistant</p>
-          </div>
-          
-          <div className="flex items-center gap-3">
-            {messages.length > 0 && (
-              <button
-                onClick={startNewChat}
-                className="flex items-center gap-2 px-3 py-2 bg-white border border-gray-200 hover:bg-gray-50 rounded-lg transition-colors text-gray-600 font-medium shadow-sm"
-              >
-                <RotateCcw className="w-4 h-4" />
-                <span className="text-sm">New Chat</span>
-              </button>
-            )}
-            
-            <div className="relative">
-            <button
-              onClick={() => setShowVoiceSelector(!showVoiceSelector)}
-              className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 hover:bg-gray-50 rounded-lg transition-colors shadow-sm"
-            >
-              <div 
-                className="w-3 h-3 rounded-full"
-                style={{ backgroundColor: selectedVoiceData.color }}
-              />
-              <span className="text-gray-700 font-medium">{selectedVoiceData.name}</span>
-            </button>
+    <div className="h-full w-full bg-white overflow-hidden font-sans text-gray-900">
+      <AnimatePresence mode="wait">
+        {!isStarted ? (
+          <StartScreen key="start" onStart={connect} />
+        ) : (
+          <LiveKitRoom
+            key="room"
+            token={token}
+            serverUrl={process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://movi-voice-i1y8hkre.livekit.cloud'}
+            connect={true}
+            audio={true}
+            video={false}
+            className="h-full w-full"
+          >
+            <ChatInterface onEnd={handleEnd} />
+          </LiveKitRoom>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
 
-            {showVoiceSelector && (
-              <div className="absolute right-0 mt-2 w-64 bg-white border border-gray-200 rounded-xl shadow-xl z-10 overflow-hidden">
-                <div className="p-2">
-                  {VOICE_PERSONAS.map((voice) => (
-                    <button
-                      key={voice.id}
-                      onClick={() => {
-                        setSelectedVoice(voice.id);
-                        setShowVoiceSelector(false);
-                      }}
-                      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
-                        selectedVoice === voice.id
-                          ? 'bg-brand-50 text-brand-700'
-                          : 'hover:bg-gray-50 text-gray-600'
-                      }`}
-                    >
-                      <div 
-                        className="w-3 h-3 rounded-full flex-shrink-0"
-                        style={{ backgroundColor: voice.color }}
-                      />
-                      <div className="text-left">
-                        <div className="font-bold text-xs">{voice.name}</div>
-                        <div className="text-[10px] opacity-70">{voice.description}</div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            </div>
-          </div>
-        </div>
+function StartScreen({ onStart }: { onStart: () => void }) {
+  return (
+    <motion.div 
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -20 }}
+      className="h-full w-full flex flex-col items-center justify-center p-6 relative bg-neutral-50 overflow-hidden"
+    >
+      {/* Background Decoration */}
+      <div className="absolute inset-0 pointer-events-none">
+        <div className="absolute inset-0 bg-[linear-gradient(to_right,#80808012_1px,transparent_1px),linear-gradient(to_bottom,#80808012_1px,transparent_1px)] bg-[size:24px_24px]"></div>
+        <div className="absolute top-0 left-0 right-0 h-96 bg-gradient-to-b from-green-50/50 to-transparent" />
       </div>
 
-      {/* Messages Area */}
-      <div className="flex-1 overflow-y-auto px-6 py-8">
-        <div className="max-w-4xl mx-auto space-y-6">
-          {messages.length === 0 ? (
-            <div className="text-center py-16">
-              <div 
-                className="w-24 h-24 rounded-full mx-auto mb-6 flex items-center justify-center shadow-sm border border-gray-100 bg-white"
-              >
-                <Mic 
-                  className="w-10 h-10"
-                  style={{ color: selectedVoiceData.color }}
-                />
-              </div>
-              <h2 className="text-xl font-bold text-gray-900 mb-2">Start Talking with {selectedVoiceData.name}</h2>
-              <p className="text-gray-500 mb-8 text-sm">Press and hold the microphone button below</p>
-            </div>
-          ) : (
-            messages.map((message) => (
-              <div
-                key={message.id}
-                className={`flex gap-4 ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
-              >
-                {message.type === 'assistant' && (
-                  <div 
-                    className="w-10 h-10 rounded-full flex-shrink-0 flex items-center justify-center bg-white border border-gray-100 shadow-sm"
-                  >
-                    <Volume2 
-                      className="w-5 h-5"
-                      style={{ color: selectedVoiceData.color }}
-                    />
-                  </div>
-                )}
-                
-                <div className={`max-w-[70%] ${message.type === 'user' ? 'order-first' : ''}`}>
-                  <div
-                    className={`rounded-2xl px-6 py-4 shadow-sm ${
-                      message.type === 'user'
-                        ? 'bg-brand-600 text-white rounded-br-none'
-                        : 'bg-white text-gray-800 border border-gray-200 rounded-bl-none'
-                    }`}
-                  >
-                    <p className="whitespace-pre-wrap text-sm">{message.text}</p>
-                    
-                    {message.audioUrl && (
-                      <button
-                        onClick={() => playAudio(message.audioUrl!, message.id)}
-                        className="mt-3 flex items-center gap-2 text-xs font-bold opacity-70 hover:opacity-100 transition-opacity"
-                      >
-                        {audioPlaying === message.id ? (
-                          <>
-                            <Volume2 className="w-3 h-3 animate-pulse" />
-                            <span>Playing...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Volume2 className="w-3 h-3" />
-                            <span>Replay Audio</span>
-                          </>
-                        )}
-                      </button>
-                    )}
-                  </div>
-                  <div className={`text-[10px] text-gray-400 mt-1 font-medium ${message.type === 'user' ? 'text-right' : 'text-left'}`}>
-                    {message.timestamp.toLocaleTimeString()}
-                  </div>
-                </div>
-
-                {message.type === 'user' && (
-                  <div className="w-10 h-10 rounded-full bg-brand-100 flex-shrink-0 flex items-center justify-center border border-brand-200">
-                    <Mic className="w-5 h-5 text-brand-600" />
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-      </div>
-
-      {/* Recording Controls */}
-      <div className="bg-white border-t border-gray-200 px-6 py-6 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
-        <div className="max-w-4xl mx-auto flex flex-col items-center gap-4">
-          {/* Microphone selector */}
-          {audioDevices.length > 0 && (
-            <div className="flex items-center gap-2 text-xs text-gray-400 mb-2">
-              <span>Input Device:</span>
-              <select
-                value={selectedDeviceId}
-                onChange={(e) => setSelectedDeviceId(e.target.value)}
-                className="bg-gray-50 border border-gray-200 rounded-md px-2 py-1 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-brand-500"
-                disabled={isRecording || isProcessing}
-              >
-                <option value="default">System Default</option>
-                {audioDevices.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label || `Microphone ${device.deviceId.slice(0, 6)}`}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          
-          {isProcessing ? (
-            <div className="flex items-center gap-3 text-brand-600 bg-brand-50 px-6 py-3 rounded-full">
-              <Loader2 className="w-5 h-5 animate-spin" />
-              <span className="font-bold text-sm">Processing...</span>
-            </div>
-          ) : (
-            <>
-              <button
-                onMouseDown={startRecording}
-                onMouseUp={stopRecording}
-                onTouchStart={startRecording}
-                onTouchEnd={stopRecording}
-                disabled={isRecording && false}
-                className={`group relative w-20 h-20 rounded-full flex items-center justify-center transition-all shadow-lg ${
-                  isRecording
-                    ? 'bg-red-500 scale-110 shadow-red-200'
-                    : 'bg-brand-600 hover:bg-brand-700 hover:scale-105 shadow-brand-200'
-                }`}
-              >
-                {isRecording ? (
-                  <MicOff className="w-8 h-8 text-white" />
-                ) : (
-                  <Mic className="w-8 h-8 text-white" />
-                )}
-                
-                {isRecording && (
-                  <div className="absolute -inset-2 rounded-full border-4 border-red-100 animate-ping" />
-                )}
-              </button>
-              
-              {isRecording && (
-                <div className="flex flex-col items-center gap-1">
-                  <div className="flex items-center gap-2 text-red-500">
-                    <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                    <span className="font-bold text-sm">{recordingDuration.toFixed(1)}s</span>
-                  </div>
-                  <p className="text-[10px] text-gray-400 font-medium">
-                    {recordingDuration < 0.5 ? 'Keep holding...' : 'Release to send'}
-                  </p>
-                </div>
-              )}
-            </>
-          )}
-        </div>
+      {/* Content */}
+      <div className="z-10 w-full max-w-4xl flex flex-col items-center">
         
-        <p className="text-center text-xs text-gray-400 mt-4 font-medium">
-          {isRecording ? 'Speaking...' : 'Press and hold to speak'}
+        {/* Hero Section */}
+        <div className="text-center mb-12">
+          <motion.div 
+            initial={{ scale: 0.8, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            transition={{ delay: 0.2 }}
+            className="w-20 h-20 bg-green-600 rounded-2xl mx-auto mb-6 flex items-center justify-center shadow-xl shadow-green-200 rotate-3 hover:rotate-6 transition-transform duration-500"
+          >
+            <Sparkles className="w-10 h-10 text-white" />
+          </motion.div>
+          
+          <h1 className="text-5xl font-bold text-gray-900 mb-4 tracking-tight">
+            Movi Voice Command
+          </h1>
+          <p className="text-lg text-gray-500 max-w-xl mx-auto leading-relaxed">
+            Natural language fleet management. Speak naturally to manage routes, trips, and vehicles.
+          </p>
+        </div>
+
+        {/* Suggestion Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 w-full mb-16 px-4">
+          {[
+            { icon: Clock, label: "Today's Schedule", text: "Show me all trips scheduled for today" },
+            { icon: Activity, label: "Live Status", text: "How many vehicles are currently active?" },
+            { icon: CheckCircle2, label: "Assign Vehicle", text: "Assign a bus to the 8 AM Tech Park route" }
+          ].map((item, i) => (
+            <motion.div
+              key={i}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.4 + (i * 0.1) }}
+              className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm hover:shadow-md transition-all cursor-default group"
+            >
+              <div className="w-10 h-10 bg-green-50 rounded-lg flex items-center justify-center mb-3 group-hover:bg-green-100 transition-colors">
+                <item.icon className="w-5 h-5 text-green-600" />
+              </div>
+              <h3 className="font-semibold text-gray-900 mb-1">{item.label}</h3>
+              <p className="text-sm text-gray-500 leading-relaxed">"{item.text}"</p>
+            </motion.div>
+          ))}
+        </div>
+
+        {/* Action Button */}
+        <motion.button
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+          onClick={onStart}
+          className="group relative flex items-center gap-4 bg-gray-900 text-white px-10 py-5 rounded-full text-lg font-medium shadow-2xl hover:bg-gray-800 transition-all overflow-hidden"
+        >
+          <div className="absolute inset-0 bg-gradient-to-r from-green-600/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+          <Mic className="w-6 h-6 text-green-400 group-hover:animate-bounce" />
+          <span className="relative z-10">Start Listening</span>
+          <ArrowRight className="w-5 h-5 opacity-50 group-hover:translate-x-1 transition-transform relative z-10" />
+        </motion.button>
+
+        <p className="mt-6 text-xs text-gray-400 font-medium tracking-wide uppercase">
+          Powered by LiveKit & OpenAI
         </p>
       </div>
+    </motion.div>
+  );
+}
+
+function ChatInterface({ onEnd }: { onEnd: () => void }) {
+  const { state, audioTrack } = useVoiceAssistant();
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [liveUserText, setLiveUserText] = useState('');
+  const [activeTools, setActiveTools] = useState<ToolStatus[]>([]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // --- Browser STT for immediate feedback ---
+  const { start: startBrowserSTT, stop: stopBrowserSTT } = useBrowserSpeech((text, isFinal) => {
+    // Only update if we are in listening state to match visual expectations
+    if (state === 'listening' || state === 'thinking') {
+      setLiveUserText(text);
+    }
+  });
+
+  useEffect(() => {
+    if (state === 'listening') {
+      startBrowserSTT();
+    } else {
+      stopBrowserSTT();
+      if (state === 'thinking' && liveUserText) {
+        // Keep the text visible while thinking
+      } else {
+        // Clear live text after a delay or when speaking starts
+        if (state === 'speaking') {
+             setLiveUserText(''); 
+        }
+      }
+    }
+  }, [state, startBrowserSTT, stopBrowserSTT, liveUserText]);
+
+  // --- LiveKit Data Channels ---
+  useDataChannel('lk.transcription', (msg) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(msg.payload));
+      if (data.text && data.participant?.identity?.includes('agent')) {
+         // Agent streaming response
+         setMessages(prev => {
+            const last = prev[prev.length - 1];
+            if (last && last.role === 'assistant' && last.isStreaming) {
+              return [...prev.slice(0, -1), { ...last, content: last.content + data.text }];
+            }
+            return [...prev, {
+              id: Date.now().toString(),
+              role: 'assistant',
+              content: data.text,
+              timestamp: new Date(),
+              isStreaming: true
+            }];
+         });
+      }
+    } catch(e) { console.error(e); }
+  });
+
+  useDataChannel('agent.thoughts', (msg) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(msg.payload));
+      // Handle tool calls visualization
+      if (data.type === 'tool_call') {
+        const newTool: ToolStatus = {
+          id: Date.now().toString(),
+          name: data.toolName || 'Unknown Tool',
+          status: 'running',
+          message: data.content
+        };
+        setActiveTools(prev => [...prev, newTool]);
+        
+        // Also add a system message for the log history
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'system',
+          content: data.content,
+          timestamp: new Date(),
+          metadata: { toolName: data.toolName, status: 'pending' }
+        }]);
+      } 
+      else if (data.type === 'tool_result') {
+        setActiveTools(prev => prev.filter(t => t.name !== data.toolName)); // Remove active tool
+        
+        setMessages(prev => {
+          // Find the pending system message and update it
+          const idx = prev.findLastIndex(m => m.role === 'system' && m.metadata?.toolName === data.toolName);
+          if (idx !== -1) {
+            const newMsgs = [...prev];
+            newMsgs[idx] = {
+              ...newMsgs[idx],
+              content: data.content, // Or keep original "Calling..." and add "Done"
+              metadata: { ...newMsgs[idx].metadata, status: 'success' }
+            };
+            return newMsgs;
+          }
+          return prev;
+        });
+      }
+    } catch(e) { console.error(e); }
+  });
+
+  // Commit user message when backend acknowledges or state changes (simplified)
+  // We actually rely on the browser STT for "preview" and could commit it as a message
+  // when the state switches to "thinking".
+  useEffect(() => {
+    if (state === 'thinking' && liveUserText) {
+      setMessages(prev => {
+        // Avoid duplicate if the last message was the same
+        const last = prev[prev.length - 1];
+        if (last?.role === 'user' && last.content === liveUserText) return prev;
+        
+        return [...prev, {
+          id: Date.now().toString(),
+          role: 'user',
+          content: liveUserText,
+          timestamp: new Date()
+        }];
+      });
+      // We don't clear liveUserText yet, wait for speaking
+    }
+  }, [state, liveUserText]);
+
+  // Auto scroll
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, liveUserText, activeTools]);
+
+  return (
+    <div className="flex flex-col h-full w-full bg-white relative">
+       <RoomAudioRenderer />
+       
+       {/* Header */}
+       <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 bg-white z-10">
+         <div className="flex items-center gap-3">
+           <div className="relative">
+             <div className="w-10 h-10 bg-green-600 rounded-full flex items-center justify-center shadow-sm">
+               <Bot className="w-5 h-5 text-white" />
+             </div>
+             <div className={cn(
+               "absolute -bottom-1 -right-1 w-3.5 h-3.5 rounded-full border-2 border-white",
+               state === 'listening' ? "bg-green-500 animate-pulse" :
+               state === 'speaking' ? "bg-emerald-400" :
+               state === 'thinking' ? "bg-amber-400 animate-bounce" : "bg-gray-300"
+             )} />
+           </div>
+           <div>
+             <h2 className="font-semibold text-gray-900">Movi Assistant</h2>
+             <p className="text-xs text-gray-500">
+               {state === 'listening' ? 'Listening...' :
+                state === 'thinking' ? 'Processing...' :
+                state === 'speaking' ? 'Speaking...' : 'Ready'}
+             </p>
+           </div>
+         </div>
+         <button 
+           onClick={onEnd}
+           className="p-2 hover:bg-red-50 text-gray-400 hover:text-red-500 rounded-full transition-colors"
+         >
+           <StopCircle className="w-6 h-6" />
+         </button>
+       </div>
+
+       {/* Messages Area */}
+       <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6 bg-gradient-to-b from-white to-gray-50">
+         {messages.length === 0 && !liveUserText && (
+           <div className="h-full flex flex-col items-center justify-center opacity-40">
+             <div className="w-20 h-20 bg-green-50 rounded-full flex items-center justify-center mb-4">
+               <Mic className="w-8 h-8 text-green-600" />
+             </div>
+             <p className="text-gray-500 font-medium">Start speaking naturally...</p>
+           </div>
+         )}
+
+         {messages.map((msg, i) => (
+           <motion.div 
+             key={msg.id}
+             initial={{ opacity: 0, y: 10 }}
+             animate={{ opacity: 1, y: 0 }}
+             className={cn(
+               "flex w-full",
+               msg.role === 'user' ? "justify-end" : "justify-start"
+             )}
+           >
+             {/* System / Tool Message */}
+             {msg.role === 'system' ? (
+               <div className="flex items-center gap-2 px-4 py-2 bg-white rounded-full text-xs text-gray-500 border border-gray-100 shadow-sm mx-auto">
+                 {msg.metadata?.status === 'success' ? (
+                   <CheckCircle2 className="w-3 h-3 text-green-500" />
+                 ) : (
+                   <Cpu className="w-3 h-3 text-blue-500 animate-spin" />
+                 )}
+                 <span className="font-medium uppercase tracking-wider text-[10px] mr-1 text-gray-400">{msg.metadata?.toolName}</span>
+                 <span className="text-gray-600">{msg.content}</span>
+               </div>
+             ) : (
+               /* Chat Message */
+               <div className={cn(
+                 "max-w-[80%] rounded-2xl p-5 shadow-sm",
+                 msg.role === 'user' 
+                   ? "bg-green-600 text-white rounded-br-none shadow-green-100" 
+                   : "bg-white border border-gray-100 text-gray-800 rounded-bl-none shadow-sm"
+               )}>
+                 <p className="text-sm leading-relaxed">{msg.content}</p>
+                 {msg.role === 'assistant' && msg.isStreaming && (
+                   <span className="inline-block w-1.5 h-4 bg-green-400 ml-1 animate-pulse align-middle" />
+                 )}
+               </div>
+             )}
+           </motion.div>
+         ))}
+
+         {/* Live User Preview */}
+         {liveUserText && (
+           <motion.div 
+             initial={{ opacity: 0 }}
+             animate={{ opacity: 1 }}
+             className="flex justify-end"
+           >
+             <div className="max-w-[80%] rounded-2xl p-5 bg-green-50 text-green-700 rounded-br-none italic border border-green-100/50">
+               <p className="text-sm">{liveUserText}...</p>
+             </div>
+           </motion.div>
+         )}
+         
+         {/* Active Tools Floating Indicator */}
+         <AnimatePresence>
+            {activeTools.map(tool => (
+              <motion.div
+                key={tool.id}
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.9 }}
+                className="mx-auto flex items-center gap-2 px-4 py-2 bg-white text-green-700 rounded-full text-xs border border-green-100 shadow-md shadow-green-100/50 z-20"
+              >
+                 <Activity className="w-3 h-3 animate-spin text-green-500" />
+                 <span className="font-medium">{tool.message}</span>
+              </motion.div>
+            ))}
+         </AnimatePresence>
+
+         <div ref={messagesEndRef} />
+       </div>
+
+       {/* Bottom Visualizer */}
+       <div className="px-6 py-8 bg-white border-t border-gray-50">
+         <div className="flex items-center justify-center gap-1 h-8">
+            {[...Array(8)].map((_, i) => (
+              <motion.div
+                key={i}
+                animate={{
+                  height: state === 'listening' ? [8, 32, 8] : state === 'speaking' ? [8, 24, 8] : 8,
+                  opacity: state === 'listening' ? 1 : state === 'speaking' ? 0.8 : 0.2
+                }}
+                transition={{
+                  repeat: Infinity,
+                  duration: 0.5,
+                  delay: i * 0.1,
+                  ease: "easeInOut"
+                }}
+                className={cn(
+                  "w-2 rounded-full",
+                  state === 'listening' ? "bg-green-600" : 
+                  state === 'speaking' ? "bg-emerald-400" : "bg-gray-300"
+                )}
+              />
+            ))}
+         </div>
+       </div>
     </div>
   );
 }

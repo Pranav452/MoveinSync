@@ -13,3 +13,8 @@ openai
 pyjwt
 python-multipart
 langsmith
+livekit
+livekit-agents
+livekit-plugins-elevenlabs
+livekit-plugins-deepgram
+livekit-plugins-openai

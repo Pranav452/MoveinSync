@@ -14,6 +14,10 @@ from io import BytesIO
 # OpenAI Direct Client
 from openai import AsyncOpenAI
 
+# LiveKit Imports
+from livekit.api import AccessToken, VideoGrants, LiveKitAPI
+from livekit.protocol import room as proto_room
+
 # LangGraph Imports
 from langchain_core.messages import HumanMessage
 from app.agent.graph import init_graph, pool as agent_pool 
@@ -110,7 +114,91 @@ class TTSRequest(BaseModel):
     text: str
     voice: str = "nova"
 
+class LiveKitTokenRequest(BaseModel):
+    room_name: str
+    participant_name: str
+
 # --- 4. ENDPOINTS ---
+
+# LIVEKIT TOKEN
+@app.post("/api/livekit-token")
+async def generate_livekit_token(req: LiveKitTokenRequest):
+    """Generate a LiveKit access token for voice chat and dispatch the agent."""
+    try:
+        api_key = os.getenv("LIVEKIT_API_KEY")
+        api_secret = os.getenv("LIVEKIT_API_SECRET")
+        livekit_url = os.getenv("LIVEKIT_URL")
+        
+        if not api_key or not api_secret or not livekit_url:
+            raise HTTPException(status_code=500, detail="LiveKit credentials not configured")
+        
+        # Generate user token
+        token = AccessToken(api_key, api_secret)
+        token.with_identity(req.participant_name)
+        token.with_name(req.participant_name)
+        
+        token.with_grants(
+            VideoGrants(
+                room_join=True,
+                room=req.room_name,
+                can_publish=True,
+                can_subscribe=True,
+                can_publish_data=True,
+                room_create=True,
+            )
+        )
+        
+        jwt_token = token.to_jwt()
+        
+        logger.info(f"🎫 Generated LiveKit token for {req.participant_name} in room {req.room_name}")
+        
+        # Create room and dispatch agent (only if not already dispatched)
+        try:
+            lk_api = LiveKitAPI(livekit_url, api_key, api_secret)
+            
+            # Create the room if it doesn't exist
+            await lk_api.room.create_room(
+                proto_room.CreateRoomRequest(
+                    name=req.room_name,
+                )
+            )
+            logger.info(f"✅ Created/verified room: {req.room_name}")
+            
+            # Check if agent is already in the room by listing participants
+            room_info = await lk_api.room.list_participants(
+                proto_room.ListParticipantsRequest(room=req.room_name)
+            )
+            
+            # Check if an agent participant is already in the room
+            agent_exists = any(
+                p.kind == proto_room.ParticipantInfo.Kind.AGENT 
+                for p in room_info.participants
+            )
+            
+            if not agent_exists:
+                # Dispatch the agent to the room
+                from livekit.protocol import agent_dispatch
+                dispatch_response = await lk_api.agent_dispatch.create_dispatch(
+                    agent_dispatch.CreateAgentDispatchRequest(
+                        room=req.room_name,
+                        agent_name="movi-voice-agent",
+                    )
+                )
+                logger.info(f"🤖 Dispatched NEW agent to room: {dispatch_response}")
+            else:
+                logger.info(f"⏭️ Agent already exists in room, skipping dispatch")
+            
+        except Exception as e:
+            logger.warning(f"Room/dispatch error: {e}")
+        
+        return {
+            "token": jwt_token,
+            "url": livekit_url,
+            "shouldConnect": True
+        }
+    except Exception as e:
+        logger.error(f"Error generating LiveKit token: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ROUTES
 @app.get("/api/routes")
