@@ -49,9 +49,3 @@ export async function uploadImageAnalysis(file: File, threadId: string, currentP
   });
   return res.json();
 }
-
-export async function getVoiceToken(username: string) {
-  const res = await fetch(`${BACKEND_URL}/token?username=${username}`);
-  if (!res.ok) throw new Error("Failed to get voice token");
-  return res.json();
-}

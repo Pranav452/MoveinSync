@@ -12,4 +12,3 @@ psycopg-pool
 openai
 pyjwt
 python-multipart
-livekit-api==0.8.2

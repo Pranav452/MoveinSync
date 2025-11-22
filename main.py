@@ -1,19 +1,15 @@
 import os
 import logging
 import base64
-import jwt
-import time
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Form, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-# FIX: Import 'api' from livekit package (Official SDK way)
-from livekit import api
+from io import BytesIO
 
 # OpenAI Direct Client
 from openai import AsyncOpenAI
@@ -93,6 +89,31 @@ async def get_stops():
 
 @app.post("/api/chat")
 async def chat_endpoint(request: Request, chat_req: ChatRequest):
+    # Check if this is from voice chat - use simple OpenAI chat
+    if chat_req.current_page == "voiceChat":
+        try:
+            logger.info(f"💬 Voice chat message: {chat_req.message[:50]}...")
+            
+            # Simple OpenAI chat for voice - no agent/database needed
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are Movi, a helpful AI assistant for MoveInSync transport management. Be concise and natural in your responses. Help with questions about buses, routes, vehicles, and transport logistics."},
+                    {"role": "user", "content": chat_req.message}
+                ],
+                max_tokens=150,
+                temperature=0.7
+            )
+            
+            return {
+                "response": response.choices[0].message.content,
+                "awaiting_confirmation": False
+            }
+        except Exception as e:
+            logger.error(f"Voice Chat Error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # For text chat, use the agent (with database)
     agent = request.app.state.agent
     try:
         config = {"configurable": {"thread_id": chat_req.thread_id}}
@@ -109,41 +130,90 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest):
         logger.error(f"Chat Error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-# FIX: Official SDK Syntax
-@app.get("/api/token")
-async def get_livekit_token(room: str = "movi-room", username: str = "Manager"):
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Transcribe audio using Whisper"""
     try:
-        api_key = os.getenv("LIVEKIT_API_KEY")
-        api_secret = os.getenv("LIVEKIT_API_SECRET")
-        livekit_url = os.getenv("LIVEKIT_URL")
-
-        if not api_key or not api_secret:
-            raise ValueError("LiveKit API Key/Secret missing")
-
-        # Manual JWT Generation (Version Agnostic)
-        current_time = int(time.time())
-        payload = {
-            "iss": api_key,
-            "sub": username,
-            "nbf": current_time,
-            "exp": current_time + (6 * 60 * 60),
-            "name": username,
-            "video": {
-                "room": room,
-                "roomJoin": True,
-                "canPublish": True,
-                "canSubscribe": True
-            }
-        }
-
-        token = jwt.encode(payload, api_secret, algorithm="HS256")
+        logger.info(f"🎤 Transcribing audio: {audio.filename}, content_type: {audio.content_type}")
         
-        logger.info(f"🎙️ Generated Manual JWT for {username}")
-        return {"token": token, "url": livekit_url}
-
+        # Read audio file
+        audio_bytes = await audio.read()
+        logger.info(f"📦 Audio size: {len(audio_bytes)} bytes")
+        
+        if len(audio_bytes) < 100:
+            logger.error("❌ Audio file too small, likely empty")
+            raise HTTPException(status_code=400, detail="Audio file is too small or empty. Please record a longer message.")
+        
+        # Create a temporary file-like object
+        audio_file = BytesIO(audio_bytes)
+        
+        # Set the correct filename based on content type
+        if audio.filename and audio.filename.endswith('.mp4'):
+            audio_file.name = "recording.mp4"
+        elif audio.filename and audio.filename.endswith('.webm'):
+            audio_file.name = "recording.webm"
+        else:
+            # Default to webm
+            audio_file.name = "recording.webm"
+        
+        logger.info(f"🎵 Processing as: {audio_file.name}")
+        
+        # Transcribe using OpenAI Whisper with context
+        transcript = await openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="text",
+            language="en",  # Hint English language
+            prompt="MoveInSync transport management: vehicles, buses, routes, trips, drivers, stops, paths, assignments, bookings"  # Context for better accuracy
+        )
+        
+        logger.info(f"✅ Transcription: {transcript}")
+        
+        if not transcript or transcript.strip() == "":
+            logger.warning("⚠️ Empty transcription received")
+            return {"text": "I couldn't hear anything. Please speak louder and try again."}
+        
+        return {"text": transcript}
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"LiveKit Token Error: {e}", exc_info=True)
+        logger.error(f"❌ Transcription error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "nova"
+
+
+@app.post("/api/text-to-speech")
+async def text_to_speech(req: TTSRequest):
+    """Generate speech using OpenAI TTS"""
+    try:
+        logger.info(f"🔊 Generating speech: {req.text[:50]}...")
+        
+        # Generate speech
+        response = await openai_client.audio.speech.create(
+            model="tts-1",
+            voice=req.voice,
+            input=req.text,
+            response_format="mp3"
+        )
+        
+        # Return audio stream
+        return StreamingResponse(
+            iter([response.content]),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "attachment; filename=speech.mp3"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"TTS error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/analyze-image")
 async def analyze_image(
