@@ -17,10 +17,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${inter.className} bg-[#0f0f1a] text-white`}>
+      <body className={`${inter.className} bg-slate-50 text-gray-900`}>
         <div className="flex min-h-screen">
           <Sidebar />
-          <main className="flex-1 ml-64 p-8 overflow-auto bg-[#0f0f1a]">
+          <main className="flex-1 ml-64 p-8 overflow-auto bg-slate-50">
             <div className="max-w-7xl mx-auto">
               {children}
             </div>

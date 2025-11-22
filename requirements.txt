@@ -12,3 +12,4 @@ psycopg-pool
 openai
 pyjwt
 python-multipart
+langsmith

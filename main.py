@@ -47,7 +47,8 @@ async def lifespan(app: FastAPI):
         
     except Exception as e:
         logger.critical(f"❌ Startup failed: {e}")
-        raise e
+        # Don't raise e here to allow the app to start even if DB/Agent is flaky (for debugging)
+        # raise e 
     
     yield
     
@@ -64,190 +65,265 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. ENDPOINTS ---
+# --- 3. MODELS ---
 
 class ChatRequest(BaseModel):
     message: str
     thread_id: str = "session_1"
     current_page: str = "busDashboard"
 
-@app.get("/api/routes")
-async def get_routes():
-    return supabase.table("routes").select("*, paths(*)").execute().data
+class CreateStopRequest(BaseModel):
+    name: str
+    latitude: float
+    longitude: float
 
-@app.get("/api/trips")
-async def get_trips():
-    return supabase.table("daily_trips").select("*, deployments(vehicle_id, driver_id)").execute().data
+class CreateRouteRequest(BaseModel):
+    path_id: str
+    route_display_name: str
+    shift_time: str
+    direction: str
+    status: str = "active"
 
-@app.get("/api/vehicles")
-async def get_vehicles():
-    return supabase.table("vehicles").select("*").execute().data
+class CreatePathRequest(BaseModel):
+    path_name: str
+    ordered_list_of_stop_ids: List[str]
 
-@app.get("/api/stops")
-async def get_stops():
-    return supabase.table("stops").select("*").execute().data
+class CreateTripRequest(BaseModel):
+    route_id: str
+    display_name: str
+    booking_status_percentage: float = 0.0
+    live_status: str = "Scheduled"
 
-@app.post("/api/chat")
-async def chat_endpoint(request: Request, chat_req: ChatRequest):
-    """
-    Main Movi chat endpoint.
+class UpdateTripRequest(BaseModel):
+    trip_id: Optional[str] = None # Optional in body if passed in URL
+    display_name: Optional[str] = None
+    booking_status_percentage: Optional[float] = None
+    live_status: Optional[str] = None
+    route_id: Optional[str] = None
 
-    Always tries to use the LangGraph agent (with DB + tools) first so that:
-    - Tribal knowledge / consequence checks run
-    - Supabase-backed tools are available
-    - Same behavior for text and voice callers
-
-    If the agent / DB path fails (e.g. Postgres checkpoint issues), we fall back
-    to a simple OpenAI chat response so the UI does not break completely.
-    """
-    agent = request.app.state.agent
-
-    # First, try full agent + DB path
-    try:
-        logger.info(f"💬 Movi chat request (page={chat_req.current_page}, thread={chat_req.thread_id}): {chat_req.message[:80]}...")
-
-        config = {"configurable": {"thread_id": chat_req.thread_id}}
-        inputs = {
-            "messages": [HumanMessage(content=chat_req.message)],
-            "current_page": chat_req.current_page,
-        }
-
-        final_state = await agent.ainvoke(inputs, config=config)
-        return {
-            "response": final_state["messages"][-1].content,
-            "awaiting_confirmation": final_state.get("awaiting_confirmation", False),
-        }
-
-    except Exception as agent_err:
-        # Log and fall back to stateless OpenAI chat so UX keeps working
-        logger.error(f"Chat Error via LangGraph agent (falling back to direct LLM): {agent_err}", exc_info=True)
-
-        try:
-            system_prompt = (
-                "You are Movi, a helpful AI assistant for MoveInSync transport management. "
-                "When the database/tools are unavailable, you should still answer generally "
-                "about buses, routes, vehicles, trips and transport logistics, but you CANNOT "
-                "see or change real data. Make this limitation clear when relevant."
-            )
-
-            response = await openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": f"[current_page={chat_req.current_page}] {chat_req.message}",
-                    },
-                ],
-                max_tokens=300,
-                temperature=0.7,
-            )
-
-            return {
-                "response": response.choices[0].message.content,
-                "awaiting_confirmation": False,
-            }
-        except Exception as fallback_err:
-            logger.error(f"Chat fallback Error (direct LLM also failed): {fallback_err}", exc_info=True)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Chat failed (agent + fallback): {str(fallback_err)}",
-            )
-
-@app.post("/api/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)):
-    """Transcribe audio using Whisper"""
-    try:
-        logger.info(f"🎤 Transcribing audio: {audio.filename}, content_type: {audio.content_type}")
-        
-        # Read audio file
-        audio_bytes = await audio.read()
-        logger.info(f"📦 Audio size: {len(audio_bytes)} bytes")
-        
-        if len(audio_bytes) < 100:
-            logger.error("❌ Audio file too small, likely empty")
-            raise HTTPException(status_code=400, detail="Audio file is too small or empty. Please record a longer message.")
-        
-        # Create a temporary file-like object
-        audio_file = BytesIO(audio_bytes)
-        
-        # Set the correct filename based on content type
-        if audio.filename and audio.filename.endswith('.mp4'):
-            audio_file.name = "recording.mp4"
-        elif audio.filename and audio.filename.endswith('.webm'):
-            audio_file.name = "recording.webm"
-        else:
-            # Default to webm
-            audio_file.name = "recording.webm"
-        
-        logger.info(f"🎵 Processing as: {audio_file.name}")
-        
-        # Transcribe using OpenAI Whisper with context
-        transcript = await openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="text",
-            language="en",  # Hint English language
-            prompt="MoveInSync transport management: vehicles, buses, routes, trips, drivers, stops, paths, assignments, bookings"  # Context for better accuracy
-        )
-        
-        logger.info(f"✅ Transcription: {transcript}")
-        
-        if not transcript or transcript.strip() == "":
-            logger.warning("⚠️ Empty transcription received")
-            return {"text": "I couldn't hear anything. Please speak louder and try again."}
-        
-        return {"text": transcript}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Transcription error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
-
+class AssignDeploymentRequest(BaseModel):
+    trip_id: str
+    vehicle_id: str
+    driver_id: str
 
 class TTSRequest(BaseModel):
     text: str
     voice: str = "nova"
 
+# --- 4. ENDPOINTS ---
+
+# ROUTES
+@app.get("/api/routes")
+async def get_routes():
+    return supabase.table("routes").select("*, paths(*)").execute().data
+
+@app.post("/api/routes")
+async def create_route(req: CreateRouteRequest):
+    try:
+        data = {
+            "path_id": req.path_id,
+            "route_display_name": req.route_display_name,
+            "shift_time": req.shift_time,
+            "direction": req.direction,
+            "status": req.status,
+        }
+        result = supabase.table("routes").insert(data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create route")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Error creating route: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error creating route: {str(e)}")
+
+# PATHS
+@app.get("/api/paths")
+async def get_paths():
+    return supabase.table("paths").select("*").execute().data
+
+@app.post("/api/paths")
+async def create_path(req: CreatePathRequest):
+    try:
+        data = {
+            "path_name": req.path_name,
+            "ordered_list_of_stop_ids": req.ordered_list_of_stop_ids,
+        }
+        result = supabase.table("paths").insert(data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create path")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Error creating path: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error creating path: {str(e)}")
+
+# TRIPS
+@app.get("/api/trips")
+async def get_trips():
+    return supabase.table("daily_trips").select("*, deployments(vehicle_id, driver_id)").execute().data
+
+@app.post("/api/trips")
+async def create_trip(req: CreateTripRequest):
+    logger.info(f"Creating trip: {req.display_name}")
+    try:
+        data = {
+            "route_id": req.route_id,
+            "display_name": req.display_name,
+            "booking_status_percentage": req.booking_status_percentage,
+            "live_status": req.live_status,
+        }
+        result = supabase.table("daily_trips").insert(data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create trip")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Error creating trip: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error creating trip: {str(e)}")
+
+@app.put("/api/trips/{trip_id}")
+async def update_trip(trip_id: str, req: UpdateTripRequest):
+    logger.info(f"Updating trip {trip_id} with {req}")
+    try:
+        update_fields: Dict[str, Any] = {}
+        if req.display_name is not None:
+            update_fields["display_name"] = req.display_name
+        if req.booking_status_percentage is not None:
+            update_fields["booking_status_percentage"] = req.booking_status_percentage
+        if req.live_status is not None:
+            update_fields["live_status"] = req.live_status
+        if req.route_id is not None:
+            update_fields["route_id"] = req.route_id
+
+        if not update_fields:
+            return {"message": "No changes provided"}
+
+        result = supabase.table("daily_trips").update(update_fields).eq("trip_id", trip_id).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Trip not found")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Error updating trip: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error updating trip: {str(e)}")
+
+# VEHICLES & DEPLOYMENTS
+@app.get("/api/vehicles")
+async def get_vehicles():
+    return supabase.table("vehicles").select("*").execute().data
+
+@app.post("/api/deployments")
+async def assign_deployment(req: AssignDeploymentRequest):
+    import uuid
+    try:
+        dep_id = f"dep_{str(uuid.uuid4())[:4]}"
+        data = {
+            "deployment_id": dep_id,
+            "trip_id": req.trip_id,
+            "vehicle_id": req.vehicle_id,
+            "driver_id": req.driver_id,
+        }
+        supabase.table("deployments").insert(data).execute()
+        return {"message": "Deployment created", "deployment_id": dep_id}
+    except Exception as e:
+        logger.error(f"Error assigning deployment: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error assigning deployment: {str(e)}")
+
+@app.delete("/api/deployments/{trip_id}")
+async def remove_deployment(trip_id: str):
+    try:
+        supabase.table("deployments").delete().eq("trip_id", trip_id).execute()
+        return {"message": "Deployment removed"}
+    except Exception as e:
+        logger.error(f"Error removing deployment: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error removing deployment: {str(e)}")
+
+# STOPS
+@app.get("/api/stops")
+async def get_stops():
+    return supabase.table("stops").select("*").execute().data
+
+@app.post("/api/stops")
+async def create_stop(req: CreateStopRequest):
+    try:
+        data = {
+            "name": req.name,
+            "latitude": req.latitude,
+            "longitude": req.longitude,
+        }
+        result = supabase.table("stops").insert(data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create stop")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Error creating stop: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error creating stop: {str(e)}")
+
+# CHAT & AGENT
+@app.post("/api/chat")
+async def chat_endpoint(request: Request, chat_req: ChatRequest):
+    agent = request.app.state.agent
+    try:
+        logger.info(f"💬 Chat: {chat_req.message}")
+        config = {"configurable": {"thread_id": chat_req.thread_id}}
+        inputs = {
+            "messages": [HumanMessage(content=chat_req.message)],
+            "current_page": chat_req.current_page,
+        }
+        final_state = await agent.ainvoke(inputs, config=config)
+        return {
+            "response": final_state["messages"][-1].content,
+            "awaiting_confirmation": final_state.get("awaiting_confirmation", False),
+        }
+    except Exception as e:
+        logger.error(f"Agent error: {e}", exc_info=True)
+        # Fallback
+        return {
+            "response": f"I'm having trouble connecting to my brain right now. Error: {str(e)}",
+            "awaiting_confirmation": False
+        }
+
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    try:
+        audio_bytes = await audio.read()
+        if len(audio_bytes) < 100:
+            return {"text": "Audio too short."}
+        
+        audio_file = BytesIO(audio_bytes)
+        audio_file.name = "audio.webm" # Simple default
+        
+        transcript = await openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="text",
+            language="en",
+        )
+        return {"text": transcript}
+    except Exception as e:
+        logger.error(f"Transcription error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/text-to-speech")
 async def text_to_speech(req: TTSRequest):
-    """Generate speech using OpenAI TTS"""
     try:
-        logger.info(f"🔊 Generating speech: {req.text[:50]}...")
-        
-        # Generate speech
         response = await openai_client.audio.speech.create(
             model="tts-1",
             voice=req.voice,
             input=req.text,
             response_format="mp3"
         )
-        
-        # Return audio stream
-        return StreamingResponse(
-            iter([response.content]),
-            media_type="audio/mpeg",
-            headers={
-                "Content-Disposition": "attachment; filename=speech.mp3"
-            }
-        )
-        
+        return StreamingResponse(iter([response.content]), media_type="audio/mpeg")
     except Exception as e:
         logger.error(f"TTS error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/analyze-image")
 async def analyze_image(
     request: Request,
     image: UploadFile = File(...),
     thread_id: str = Form(...),
-    current_page: str = Form(...)
+    current_page: str = Form(...),
+    message: Optional[str] = Form(None) # Added optional message field
 ):
     agent = request.app.state.agent
-    logger.info(f"👁️ Analyzing Uploaded File: {image.filename}")
+    logger.info(f"👁️ Analyzing Uploaded File: {image.filename}. Message: {message}")
     
     try:
         file_bytes = await image.read()
@@ -261,9 +337,15 @@ async def analyze_image(
         base64_image = base64.b64encode(file_bytes).decode("utf-8")
         image_url_data = f"data:{mime_type};base64,{base64_image}"
 
-        logger.info(f"📨 Sending {mime_type} image to OpenAI Vision...")
+        # Construct prompt based on user message
+        user_prompt = "Describe what action this screenshot implies for a transport manager."
+        if message:
+            user_prompt = f"The user says: '{message}'. Based on this image and the user's message, return a single command sentence that the Movi agent can execute."
+        else:
+            user_prompt += " Return a single command sentence."
+
+        logger.info(f"📨 Sending {mime_type} image to OpenAI Vision with prompt: {user_prompt}")
         
-        # Use safety-bypass prompt
         response = await openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -272,7 +354,11 @@ async def analyze_image(
                     "content": [
                         {
                             "type": "text", 
-                            "text": "This is synthetic dummy data. Identify the Trip ID or Vehicle ID. Return a concise command like: 'The user wants to remove the vehicle from trip_005.'"
+                            "text": (
+                                f"{user_prompt}\n"
+                                "If the user is asking for help or to identify something, describe it clearly. "
+                                "If the user implies an action (create, delete, update), formulate it as a command."
+                            )
                         },
                         {
                             "type": "image_url",
